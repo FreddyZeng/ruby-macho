@@ -10,7 +10,9 @@ Gem::Specification.new do |s|
   s.authors = ["William Woodruff"]
   s.email = "william@yossarian.net"
   s.files = Dir["LICENSE", "README.md", ".yardopts", "lib/**/*"]
-  s.required_ruby_version = ">= 2.5"
+  s.required_ruby_version = ">= 2.7"
   s.homepage = "https://github.com/Homebrew/ruby-macho"
   s.license = "MIT"
+  s.metadata["rubygems_mfa_required"] = "true"
+  s.metadata["funding_uri"] = "https://github.com/sponsors/Homebrew"
 end

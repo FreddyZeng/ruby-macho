@@ -37,6 +37,18 @@ module MachO
     # @api private
     MH_CIGAM_64 = 0xcffaedfe
 
+    # compressed mach-o magic
+    # @api private
+    COMPRESSED_MAGIC = 0x636f6d70 # "comp"
+
+    # a compressed mach-o slice, using LZSS for compression
+    # @api private
+    COMP_TYPE_LZSS = 0x6c7a7373 # "lzss"
+
+    # a compressed mach-o slice, using LZVN ("FastLib") for compression
+    # @api private
+    COMP_TYPE_FASTLIB = 0x6c7a766e # "lzvn"
+
     # association of magic numbers to string representations
     # @api private
     MH_MAGICS = {
@@ -433,6 +445,19 @@ module MachO
     # @api private
     MH_KEXT_BUNDLE = 0xb
 
+    # a set of Mach-Os, running in the same userspace, sharing a linkedit.  The kext collection files are an example
+    # of this object type
+    # @api private
+    MH_FILESET = 0xc
+
+    # gpu program
+    # @api private
+    MH_GPU_EXECUTE = 0xd
+
+    # gpu support functions
+    # @api private
+    MH_GPU_DYLIB = 0xe
+
     # association of filetypes to Symbol representations
     # @api private
     MH_FILETYPES = {
@@ -447,6 +472,9 @@ module MachO
       MH_DYLIB_STUB => :dylib_stub,
       MH_DSYM => :dsym,
       MH_KEXT_BUNDLE => :kext_bundle,
+      MH_FILESET => :fileset,
+      MH_GPU_EXECUTE => :gpu_execute,
+      MH_GPU_DYLIB => :gpu_dylib,
     }.freeze
 
     # association of mach header flag symbols to values
@@ -477,37 +505,24 @@ module MachO
       :MH_DEAD_STRIPPABLE_DYLIB => 0x400000,
       :MH_HAS_TLV_DESCRIPTORS => 0x800000,
       :MH_NO_HEAP_EXECUTION => 0x1000000,
-      :MH_APP_EXTENSION_SAFE => 0x02000000,
+      :MH_APP_EXTENSION_SAFE => 0x2000000,
+      :MH_NLIST_OUTOFSYNC_WITH_DYLDINFO => 0x4000000,
+      :MH_SIM_SUPPORT => 0x8000000,
+      :MH_DYLIB_IN_CACHE => 0x80000000,
     }.freeze
 
     # Fat binary header structure
     # @see MachO::FatArch
     class FatHeader < MachOStructure
       # @return [Integer] the magic number of the header (and file)
-      attr_reader :magic
+      field :magic, :uint32, :endian => :big
 
       # @return [Integer] the number of fat architecture structures following the header
-      attr_reader :nfat_arch
-
-      # always big-endian
-      # @see MachOStructure::FORMAT
-      # @api private
-      FORMAT = "N2"
-
-      # @see MachOStructure::SIZEOF
-      # @api private
-      SIZEOF = 8
-
-      # @api private
-      def initialize(magic, nfat_arch)
-        super()
-        @magic = magic
-        @nfat_arch = nfat_arch
-      end
+      field :nfat_arch, :uint32, :endian => :big
 
       # @return [String] the serialized fields of the fat header
       def serialize
-        [magic, nfat_arch].pack(FORMAT)
+        [magic, nfat_arch].pack(self.class.format)
       end
 
       # @return [Hash] a hash representation of this {FatHeader}
@@ -527,42 +542,23 @@ module MachO
     # @see MachO::Headers::FatHeader
     class FatArch < MachOStructure
       # @return [Integer] the CPU type of the Mach-O
-      attr_reader :cputype
+      field :cputype, :uint32, :endian => :big
 
       # @return [Integer] the CPU subtype of the Mach-O
-      attr_reader :cpusubtype
+      field :cpusubtype, :uint32, :endian => :big, :mask => CPU_SUBTYPE_MASK
 
       # @return [Integer] the file offset to the beginning of the Mach-O data
-      attr_reader :offset
+      field :offset, :uint32, :endian => :big
 
       # @return [Integer] the size, in bytes, of the Mach-O data
-      attr_reader :size
+      field :size, :uint32, :endian => :big
 
       # @return [Integer] the alignment, as a power of 2
-      attr_reader :align
-
-      # @note Always big endian.
-      # @see MachOStructure::FORMAT
-      # @api private
-      FORMAT = "L>5"
-
-      # @see MachOStructure::SIZEOF
-      # @api private
-      SIZEOF = 20
-
-      # @api private
-      def initialize(cputype, cpusubtype, offset, size, align)
-        super()
-        @cputype = cputype
-        @cpusubtype = cpusubtype & ~CPU_SUBTYPE_MASK
-        @offset = offset
-        @size = size
-        @align = align
-      end
+      field :align, :uint32, :endian => :big
 
       # @return [String] the serialized fields of the fat arch
       def serialize
-        [cputype, cpusubtype, offset, size, align].pack(FORMAT)
+        [cputype, cpusubtype, offset, size, align].pack(self.class.format)
       end
 
       # @return [Hash] a hash representation of this {FatArch}
@@ -585,27 +581,18 @@ module MachO
     #  Mach-Os that it points to necessarily *are* 64-bit.
     # @see MachO::Headers::FatHeader
     class FatArch64 < FatArch
+      # @return [Integer] the file offset to the beginning of the Mach-O data
+      field :offset, :uint64, :endian => :big
+
+      # @return [Integer] the size, in bytes, of the Mach-O data
+      field :size, :uint64, :endian => :big
+
       # @return [void]
-      attr_reader :reserved
-
-      # @note Always big endian.
-      # @see MachOStructure::FORMAT
-      # @api private
-      FORMAT = "L>2Q>2L>2"
-
-      # @see MachOStructure::SIZEOF
-      # @api private
-      SIZEOF = 32
-
-      # @api private
-      def initialize(cputype, cpusubtype, offset, size, align, reserved = 0)
-        super(cputype, cpusubtype, offset, size, align)
-        @reserved = reserved
-      end
+      field :reserved, :uint32, :endian => :big, :default => 0
 
       # @return [String] the serialized fields of the fat arch
       def serialize
-        [cputype, cpusubtype, offset, size, align, reserved].pack(FORMAT)
+        [cputype, cpusubtype, offset, size, align, reserved].pack(self.class.format)
       end
 
       # @return [Hash] a hash representation of this {FatArch64}
@@ -619,48 +606,25 @@ module MachO
     # 32-bit Mach-O file header structure
     class MachHeader < MachOStructure
       # @return [Integer] the magic number
-      attr_reader :magic
+      field :magic, :uint32
 
       # @return [Integer] the CPU type of the Mach-O
-      attr_reader :cputype
+      field :cputype, :uint32
 
       # @return [Integer] the CPU subtype of the Mach-O
-      attr_reader :cpusubtype
+      field :cpusubtype, :uint32, :mask => CPU_SUBTYPE_MASK
 
       # @return [Integer] the file type of the Mach-O
-      attr_reader :filetype
+      field :filetype, :uint32
 
       # @return [Integer] the number of load commands in the Mach-O
-      attr_reader :ncmds
+      field :ncmds, :uint32
 
       # @return [Integer] the size of all load commands, in bytes, in the Mach-O
-      attr_reader :sizeofcmds
+      field :sizeofcmds, :uint32
 
       # @return [Integer] the header flags associated with the Mach-O
-      attr_reader :flags
-
-      # @see MachOStructure::FORMAT
-      # @api private
-      FORMAT = "L=7"
-
-      # @see MachOStructure::SIZEOF
-      # @api private
-      SIZEOF = 28
-
-      # @api private
-      def initialize(magic, cputype, cpusubtype, filetype, ncmds, sizeofcmds,
-                     flags)
-        super()
-        @magic = magic
-        @cputype = cputype
-        # For now we're not interested in additional capability bits also to be
-        # found in the `cpusubtype` field. We only care about the CPU sub-type.
-        @cpusubtype = cpusubtype & ~CPU_SUBTYPE_MASK
-        @filetype = filetype
-        @ncmds = ncmds
-        @sizeofcmds = sizeofcmds
-        @flags = flags
-      end
+      field :flags, :uint32
 
       # @example
       #  puts "this mach-o has position-independent execution" if header.flag?(:MH_PIE)
@@ -724,6 +688,11 @@ module MachO
         filetype == Headers::MH_KEXT_BUNDLE
       end
 
+      # @return [Boolean] whether or not the file is of type `MH_FILESET`
+      def fileset?
+        filetype == Headers::MH_FILESET
+      end
+
       # @return [Boolean] true if the Mach-O has 32-bit magic, false otherwise
       def magic32?
         Utils.magic32?(magic)
@@ -761,27 +730,72 @@ module MachO
     # 64-bit Mach-O file header structure
     class MachHeader64 < MachHeader
       # @return [void]
-      attr_reader :reserved
-
-      # @see MachOStructure::FORMAT
-      # @api private
-      FORMAT = "L=8"
-
-      # @see MachOStructure::SIZEOF
-      # @api private
-      SIZEOF = 32
-
-      # @api private
-      def initialize(magic, cputype, cpusubtype, filetype, ncmds, sizeofcmds,
-                     flags, reserved)
-        super(magic, cputype, cpusubtype, filetype, ncmds, sizeofcmds, flags)
-        @reserved = reserved
-      end
+      field :reserved, :uint32
 
       # @return [Hash] a hash representation of this {MachHeader64}
       def to_h
         {
           "reserved" => reserved,
+        }.merge super
+      end
+    end
+
+    # Prelinked kernel/"kernelcache" header structure
+    class PrelinkedKernelHeader < MachOStructure
+      # @return [Integer] the magic number for a compressed header ({COMPRESSED_MAGIC})
+      field :signature, :uint32, :endian => :big
+
+      # @return [Integer] the type of compression used
+      field :compress_type, :uint32, :endian => :big
+
+      # @return [Integer] a checksum for the uncompressed data
+      field :adler32, :uint32, :endian => :big
+
+      # @return [Integer] the size of the uncompressed data, in bytes
+      field :uncompressed_size, :uint32, :endian => :big
+
+      # @return [Integer] the size of the compressed data, in bytes
+      field :compressed_size, :uint32, :endian => :big
+
+      # @return [Integer] the version of the prelink format
+      field :prelink_version, :uint32, :endian => :big
+
+      # @return [void]
+      field :reserved, :string, :size => 40, :unpack => "L>10"
+
+      # @return [void]
+      field :platform_name, :string, :size => 64
+
+      # @return [void]
+      field :root_path, :string, :size => 256
+
+      # @return [Boolean] whether this prelinked kernel supports KASLR
+      def kaslr?
+        prelink_version >= 1
+      end
+
+      # @return [Boolean] whether this prelinked kernel is compressed with LZSS
+      def lzss?
+        compress_type == COMP_TYPE_LZSS
+      end
+
+      # @return [Boolean] whether this prelinked kernel is compressed with LZVN
+      def lzvn?
+        compress_type == COMP_TYPE_FASTLIB
+      end
+
+      # @return [Hash] a hash representation of this {PrelinkedKernelHeader}
+      def to_h
+        {
+          "signature" => signature,
+          "compress_type" => compress_type,
+          "adler32" => adler32,
+          "uncompressed_size" => uncompressed_size,
+          "compressed_size" => compressed_size,
+          "prelink_version" => prelink_version,
+          "reserved" => reserved,
+          "platform_name" => platform_name,
+          "root_path" => root_path,
         }.merge super
       end
     end

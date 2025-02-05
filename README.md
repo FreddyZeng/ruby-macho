@@ -2,7 +2,7 @@ ruby-macho
 ================
 
 [![Gem Version](https://badge.fury.io/rb/ruby-macho.svg)](http://badge.fury.io/rb/ruby-macho)
-[![Build Status](https://travis-ci.org/Homebrew/ruby-macho.svg?branch=master)](https://travis-ci.org/Homebrew/ruby-macho)
+[![CI](https://github.com/Homebrew/ruby-macho/actions/workflows/tests.yml/badge.svg)](https://github.com/Homebrew/ruby-macho/actions/workflows/tests.yml)
 [![Coverage Status](https://codecov.io/gh/Homebrew/ruby-macho/branch/master/graph/badge.svg)](https://codecov.io/gh/Homebrew/ruby-macho)
 
 A Ruby library for examining and modifying Mach-O files.
@@ -56,11 +56,24 @@ puts lc_vers.version_string # => "10.10.0"
 
 * Unit and performance testing.
 
-Attribution:
+### Contributing, setting up `overcommit` and the linters
+
+In order to keep the repo, docs and data tidy, we use a tool called [`overcommit`](https://github.com/sds/overcommit)
+to connect up the git hooks to a set of quality checks.  The fastest way to get setup is to run the following to make
+sure you have all the tools:
+
+```shell
+gem install overcommit bundler
+bundle install
+overcommit --install
+```
+
+### Attribution
 
 * Constants were taken from Apple, Inc's
-[`loader.h` in `cctools/include/mach-o`](https://www.opensource.apple.com/source/cctools/cctools-870/include/mach-o/loader.h).
+[`loader.h` in `cctools/include/mach-o`](https://opensource.apple.com/source/cctools/cctools-973.0.1/include/mach-o/loader.h.auto.html).
 (Apple Public Source License 2.0).
+* Binary files used for testing were taken from The LLVM Project. ([Apache License v2.0 with LLVM Exceptions](test/bin/llvm/LICENSE.txt)).
 
 ### License
 

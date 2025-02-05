@@ -34,7 +34,11 @@ module MachO
     # @param bin [String] a binary string containing raw Mach-O data
     # @param opts [Hash] options to control the parser with
     # @option opts [Boolean] :permissive whether to ignore unknown load commands
+    # @option opts [Boolean] :decompress whether to decompress, if capable
     # @return [MachOFile] a new MachOFile
+    # @note The `:decompress` option relies on non-default dependencies. Compression
+    #  is only used in niche Mach-Os, so leaving this disabled is a reasonable default for
+    #  virtually all normal uses.
     def self.new_from_bin(bin, **opts)
       instance = allocate
       instance.initialize_from_bin(bin, opts)
@@ -46,13 +50,17 @@ module MachO
     # @param filename [String] the Mach-O file to load from
     # @param opts [Hash] options to control the parser with
     # @option opts [Boolean] :permissive whether to ignore unknown load commands
+    # @option opts [Boolean] :decompress whether to decompress, if capable
     # @raise [ArgumentError] if the given file does not exist
+    # @note The `:decompress` option relies on non-default dependencies. Compression
+    #  is only used in niche Mach-Os, so leaving this disabled is a reasonable default for
+    #  virtually all normal uses.
     def initialize(filename, **opts)
       raise ArgumentError, "#{filename}: no such file" unless File.file?(filename)
 
       @filename = filename
       @options = opts
-      @raw_data = File.open(@filename, "rb", &:read)
+      @raw_data = File.binread(@filename)
       populate_fields
     end
 
@@ -152,8 +160,8 @@ module MachO
     #  the instance fields
     # @raise [OffsetInsertionError] if the offset is not in the load command region
     # @raise [HeaderPadError] if the new command exceeds the header pad buffer
-    # @note Calling this method with an arbitrary offset in the load command
-    #  region **will leave the object in an inconsistent state**.
+    # @note Calling this method with an arbitrary offset in the load command region
+    # **will leave the object in an inconsistent state**.
     def insert_command(offset, lc, options = {})
       context = LoadCommands::LoadCommand::SerializationContext.context_for(self)
       cmd_raw = lc.serialize(context)
@@ -196,7 +204,7 @@ module MachO
     # Appends a new load command to the Mach-O.
     # @param lc [LoadCommands::LoadCommand] the load command being added
     # @param options [Hash]
-    # @option options [Boolean] :repopulate (true) whether or not to repopulate
+    # @option f [Boolean] :repopulate (true) whether or not to repopulate
     #  the instance fields
     # @return [void]
     # @see #insert_command
@@ -368,20 +376,18 @@ module MachO
     #  file.change_rpath("/usr/lib", "/usr/local/lib")
     # @param old_path [String] the old runtime path
     # @param new_path [String] the new runtime path
-    # @param _options [Hash]
+    # @param options [Hash]
+    # @option options [Boolean] :uniq (false) if true, change duplicate
+    #  rpaths simultaneously.
     # @return [void]
     # @raise [RpathUnknownError] if no such old runtime path exists
-    # @raise [RpathExistsError] if the new runtime path already exists
-    # @note `_options` is currently unused and is provided for signature
-    #  compatibility with {MachO::FatFile#change_rpath}
-    def change_rpath(old_path, new_path, _options = {})
+    def change_rpath(old_path, new_path, options = {})
       old_lc = command(:LC_RPATH).find { |r| r.path.to_s == old_path }
       raise RpathUnknownError, old_path if old_lc.nil?
-      raise RpathExistsError, new_path if rpaths.include?(new_path)
 
       new_lc = LoadCommands::LoadCommand.create(:LC_RPATH, new_path)
 
-      delete_rpath(old_path)
+      delete_rpath(old_path, options)
       insert_command(old_lc.view.offset, new_lc)
     end
 
@@ -405,31 +411,48 @@ module MachO
 
     # Delete the given runtime path from the Mach-O.
     # @example
-    #  file.rpaths # => ["/lib"]
-    #  file.delete_rpath("/lib")
-    #  file.rpaths # => []
+    #  file1.rpaths # => ["/lib", "/usr/lib", "/lib"]
+    #  file1.delete_rpath("/lib")
+    #  file1.rpaths # => ["/usr/lib", "/lib"]
+    #  file2.rpaths # => ["foo", "foo"]
+    #  file2.delete_rpath("foo", :uniq => true)
+    #  file2.rpaths # => []
+    #  file3.rpaths # => ["foo", "bar", "foo"]
+    #  file3.delete_rpath("foo", :last => true)
+    #  file3.rpaths # => ["foo", "bar"]
     # @param path [String] the runtime path to delete
-    # @param _options [Hash]
+    # @param options [Hash]
+    # @option options [Boolean] :uniq (false) if true, also delete
+    #  duplicates of the requested path. If false, delete the first
+    #  instance (by offset) of the requested path, unless :last is true.
+    #  Incompatible with :last.
+    # @option options [Boolean] :last (false) if true, delete the last
+    #  instance (by offset) of the requested path. Incompatible with :uniq.
     # @return void
     # @raise [RpathUnknownError] if no such runtime path exists
-    # @note `_options` is currently unused and is provided for signature
-    #  compatibility with {MachO::FatFile#delete_rpath}
-    def delete_rpath(path, _options = {})
-      rpath_cmds = command(:LC_RPATH).select { |r| r.path.to_s == path }
+    # @raise [ArgumentError] if both :uniq and :last are true
+    def delete_rpath(path, options = {})
+      uniq = options.fetch(:uniq, false)
+      last = options.fetch(:last, false)
+      raise ArgumentError, "Cannot set both :uniq and :last to true" if uniq && last
+
+      search_method = uniq || last ? :select : :find
+      rpath_cmds = command(:LC_RPATH).public_send(search_method) { |r| r.path.to_s == path }
+      rpath_cmds = rpath_cmds.last if last
+
+      # Cast rpath_cmds into an Array so we can handle the uniq and non-uniq cases the same way
+      rpath_cmds = Array(rpath_cmds)
       raise RpathUnknownError, path if rpath_cmds.empty?
 
-      # delete the commands in reverse order, offset descending. this
-      # allows us to defer (expensive) field population until the very end
-      rpath_cmds.reverse_each { |cmd| delete_command(cmd, :repopulate => false) }
-
-      populate_fields
+      # delete the commands in reverse order, offset descending.
+      rpath_cmds.reverse_each { |cmd| delete_command(cmd) }
     end
 
     # Write all Mach-O data to the given filename.
     # @param filename [String] the file to write to
     # @return [void]
     def write(filename)
-      File.open(filename, "wb") { |f| f.write(@raw_data) }
+      File.binwrite(filename, @raw_data)
     end
 
     # Write all Mach-O data to the file used to initialize the instance.
@@ -439,7 +462,7 @@ module MachO
     def write!
       raise MachOError, "no initial file to write to" if @filename.nil?
 
-      File.open(@filename, "wb") { |f| f.write(@raw_data) }
+      File.binwrite(@filename, @raw_data)
     end
 
     # @return [Hash] a hash representation of this {MachOFile}
@@ -461,6 +484,9 @@ module MachO
       # the smallest Mach-O header is 28 bytes
       raise TruncatedFileError if @raw_data.size < 28
 
+      magic = @raw_data[0..3].unpack1("N")
+      populate_prelinked_kernel_header if Utils.compressed_magic?(magic)
+
       magic = populate_and_check_magic
       mh_klass = Utils.magic32?(magic) ? Headers::MachHeader : Headers::MachHeader64
       mh = mh_klass.new_from_bin(endianness, @raw_data[0, mh_klass.bytesize])
@@ -470,6 +496,48 @@ module MachO
       check_filetype(mh.filetype)
 
       mh
+    end
+
+    # Read a compressed Mach-O header and check its validity, as well as whether we're able
+    # to parse it.
+    # @return [void]
+    # @raise [CompressedMachOError] if we weren't asked to perform decompression
+    # @raise [DecompressionError] if decompression is impossible or fails
+    # @api private
+    def populate_prelinked_kernel_header
+      raise CompressedMachOError unless options.fetch(:decompress, false)
+
+      @plh = Headers::PrelinkedKernelHeader.new_from_bin :big, @raw_data[0, Headers::PrelinkedKernelHeader.bytesize]
+
+      raise DecompressionError, "unsupported compression type: LZSS" if @plh.lzss?
+      raise DecompressionError, "unknown compression type: 0x#{plh.compress_type.to_s 16}" unless @plh.lzvn?
+
+      decompress_macho_lzvn
+    end
+
+    # Attempt to decompress a Mach-O file from the data specified in a prelinked kernel header.
+    # @return [void]
+    # @raise [DecompressionError] if decompression is impossible or fails
+    # @api private
+    # @note This method rewrites the internal state of {MachOFile} to pretend as if it was never
+    #  compressed to begin with, allowing all other APIs to transparently act on compressed Mach-Os.
+    def decompress_macho_lzvn
+      begin
+        require "lzfse"
+      rescue LoadError
+        raise DecompressionError, "LZVN required but the optional 'lzfse' gem is not installed"
+      end
+
+      # From this point onwards, the internal buffer of this MachOFile refers to the decompressed
+      # contents specified by the prelinked kernel header.
+      begin
+        @raw_data = LZFSE.lzvn_decompress @raw_data.slice(Headers::PrelinkedKernelHeader.bytesize, @plh.compressed_size)
+        # Sanity checks.
+        raise DecompressionError if @raw_data.size != @plh.uncompressed_size
+        # TODO: check the adler32 CRC in @plh
+      rescue LZFSE::DecodeError
+        raise DecompressionError, "LZVN decompression failed"
+      end
     end
 
     # Read just the file's magic number and check its validity.
@@ -537,7 +605,7 @@ module MachO
           LoadCommands::LoadCommand
         end
 
-        view = MachOView.new(@raw_data, endianness, offset)
+        view = MachOView.new(self, @raw_data, endianness, offset)
         command = klass.new_from_bin(view)
 
         load_commands << command
@@ -556,8 +624,8 @@ module MachO
       segments.each do |seg|
         seg.sections.each do |sect|
           next if sect.empty?
-          next if sect.flag?(:S_ZEROFILL)
-          next if sect.flag?(:S_THREAD_LOCAL_ZEROFILL)
+          next if sect.type?(:S_ZEROFILL)
+          next if sect.type?(:S_THREAD_LOCAL_ZEROFILL)
           next unless sect.offset < offset
 
           offset = sect.offset

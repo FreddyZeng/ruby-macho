@@ -112,6 +112,7 @@ class MachOFileTest < Minitest::Test
         assert_kind_of MachO::LoadCommands::SegmentCommand, seg if file.magic32?
         assert_kind_of MachO::LoadCommands::SegmentCommand64, seg if file.magic64?
         assert_kind_of String, seg.segname
+        assert_equal seg.segname, seg.to_s
         assert_kind_of Integer, seg.vmaddr
         assert_kind_of Integer, seg.vmsize
         assert_kind_of Integer, seg.fileoff
@@ -121,6 +122,7 @@ class MachOFileTest < Minitest::Test
         assert_kind_of Integer, seg.nsects
         assert_kind_of Integer, seg.flags
         refute seg.flag?(:THIS_IS_A_MADE_UP_FLAG)
+        assert(MachO::LoadCommands::SEGMENT_FLAGS.keys.one? { |sf| seg.flag?(sf) }) if seg.flags != 0
 
         sections = seg.sections
 
@@ -141,6 +143,11 @@ class MachOFileTest < Minitest::Test
           assert_kind_of Integer, sect.nreloc
           assert_kind_of Integer, sect.flags
           refute sect.flag?(:THIS_IS_A_MADE_UP_FLAG)
+          assert_kind_of Integer, sect.type
+          assert MachO::Sections::SECTION_TYPES.values.include?(sect.type)
+          assert(MachO::Sections::SECTION_TYPES.keys.one? { |st| sect.type?(st) })
+          assert_kind_of Integer, sect.attributes
+          assert(MachO::Sections::SECTION_ATTRIBUTES.keys.any? { |sa| sect.attribute?(sa) })
           assert_kind_of Integer, sect.reserved1
           assert_kind_of Integer, sect.reserved2
           assert_kind_of Integer, sect.reserved3 if sect.is_a? MachO::Sections::Section64
@@ -228,12 +235,12 @@ class MachOFileTest < Minitest::Test
 
   def test_extra_dylib
     filenames = SINGLE_ARCHES.map { |a| fixture(a, "libextrahello.dylib") }
-    unusual_dylib_lcs = %i[
-      LC_LOAD_UPWARD_DYLIB
-      LC_LAZY_LOAD_DYLIB
-      LC_LOAD_WEAK_DYLIB
-      LC_REEXPORT_DYLIB
-    ]
+    unusual_dylib_lcs = {
+      :LC_LOAD_UPWARD_DYLIB => :DYLIB_USE_UPWARD,
+      :LC_LAZY_LOAD_DYLIB => nil,
+      :LC_LOAD_WEAK_DYLIB => :DYLIB_USE_WEAK_LINK,
+      :LC_REEXPORT_DYLIB => :DYLIB_USE_REEXPORT,
+    }
 
     filenames.each do |fn|
       file = MachO::MachOFile.new(fn)
@@ -241,7 +248,7 @@ class MachOFileTest < Minitest::Test
       assert file.dylib?
 
       # make sure we can read more unusual dylib load commands
-      unusual_dylib_lcs.each do |cmdname|
+      unusual_dylib_lcs.each do |cmdname, flag_name|
         lc = file[cmdname].first
 
         # PPC and x86-family binaries don't have the same dylib LCs, so ignore
@@ -255,7 +262,34 @@ class MachOFileTest < Minitest::Test
 
         assert dylib_name
         assert_kind_of MachO::LoadCommands::LoadCommand::LCStr, dylib_name
+
+        assert lc.flag?(flag_name) if flag_name
+        (unusual_dylib_lcs.values - [flag_name]).compact.each do |other_flag_name|
+          refute lc.flag?(other_flag_name)
+        end
       end
+    end
+  end
+
+  def test_dylib_use_command
+    filenames = SINGLE_64_ARCHES.map { |a| fixture(a, "dylib_use_command-weak-delay.bin") }
+
+    filenames.each do |fn|
+      file = MachO::MachOFile.new(fn)
+
+      lc = file[:LC_LOAD_WEAK_DYLIB].first
+      lc2 = file[:LC_LOAD_DYLIB].first
+
+      assert_instance_of MachO::LoadCommands::DylibUseCommand, lc
+      assert_instance_of MachO::LoadCommands::DylibCommand, lc2
+
+      refute_equal lc.flags, 0
+
+      assert lc.flag?(:DYLIB_USE_WEAK_LINK)
+      assert lc.flag?(:DYLIB_USE_DELAYED_INIT)
+      refute lc.flag?(:DYLIB_USE_UPWARD)
+
+      refute lc2.flag?(:DYLIB_USE_WEAK_LINK)
     end
   end
 
@@ -409,6 +443,14 @@ class MachOFileTest < Minitest::Test
       # there should be at least one rpath in each binary
       refute_empty rpaths
 
+      # We should ignore errors when changing to an existing rpath
+      # This is the same behaviour as `install_name_tool`
+      file.change_rpath(rpaths.first, rpaths.first)
+      new_rpaths = file.rpaths
+
+      assert_equal new_rpaths.first, rpaths.first
+      refute_empty new_rpaths.first, rpaths.first
+
       file.change_rpath(rpaths.first, "/usr/lib")
       new_rpaths = file.rpaths
 
@@ -443,6 +485,56 @@ class MachOFileTest < Minitest::Test
       end
     end
 
+    groups << ["libdupe.dylib", "libdupe_actual.dylib"].map do |fn|
+      fixture(:x86_64, fn)
+    end
+
+    groups.each do |filename, actual|
+      file = MachO::MachOFile.new(filename)
+
+      refute_empty file.rpaths
+      orig_ncmds = current_ncmds = file.ncmds
+      orig_sizeofcmds = file.sizeofcmds
+      orig_npaths = current_npaths = file.rpaths.size
+
+      file.rpaths.each do |rpath|
+        file.delete_rpath(rpath)
+        current_npaths -= 1
+        current_ncmds -= 1
+
+        assert_equal file.ncmds, current_ncmds
+        assert_equal file.rpaths.size, current_npaths
+        assert_operator file.sizeofcmds, :<, orig_sizeofcmds
+      end
+
+      file.write(actual)
+      # ensure we can actually re-load and parse the modified file
+      modified = MachO::MachOFile.new(actual)
+
+      assert_empty modified.rpaths
+      assert_equal file.serialize.bytesize, modified.serialize.bytesize
+      assert_operator modified.ncmds, :<, orig_ncmds
+      assert_operator modified.sizeofcmds, :<, orig_sizeofcmds
+      assert_equal file.rpaths.size, modified.rpaths.size
+      assert_operator modified.rpaths.size, :<, orig_npaths
+    end
+  ensure
+    groups.each do |_, actual|
+      delete_if_exists(actual)
+    end
+  end
+
+  def test_delete_rpath_uniq
+    groups = SINGLE_ARCHES.map do |arch|
+      ["hello.bin", "hello_actual.bin"].map do |fn|
+        fixture(arch, fn)
+      end
+    end
+
+    groups << ["libdupe.dylib", "libdupe_actual.dylib"].map do |fn|
+      fixture(:x86_64, fn)
+    end
+
     groups.each do |filename, actual|
       file = MachO::MachOFile.new(filename)
 
@@ -451,15 +543,61 @@ class MachOFileTest < Minitest::Test
       orig_sizeofcmds = file.sizeofcmds
       orig_npaths = file.rpaths.size
 
-      file.delete_rpath(file.rpaths.first)
+      file.delete_rpath(file.rpaths.first, :uniq => true)
       assert_operator file.ncmds, :<, orig_ncmds
       assert_operator file.sizeofcmds, :<, orig_sizeofcmds
       assert_operator file.rpaths.size, :<, orig_npaths
+      # libdupe rpaths: ["foo", "bar", "foo"]
+      assert_equal file.rpaths, ["bar"] if filename.end_with?("libdupe.dylib")
 
       file.write(actual)
       # ensure we can actually re-load and parse the modified file
       modified = MachO::MachOFile.new(actual)
 
+      assert_empty modified.rpaths unless filename.end_with?("libdupe.dylib")
+      assert_equal file.serialize.bytesize, modified.serialize.bytesize
+      assert_operator modified.ncmds, :<, orig_ncmds
+      assert_operator modified.sizeofcmds, :<, orig_sizeofcmds
+      assert_equal file.rpaths.size, modified.rpaths.size
+      assert_operator modified.rpaths.size, :<, orig_npaths
+    end
+  ensure
+    groups.each do |_, actual|
+      delete_if_exists(actual)
+    end
+  end
+
+  def test_delete_rpath_last
+    groups = SINGLE_ARCHES.map do |arch|
+      ["hello.bin", "hello_actual.bin"].map do |fn|
+        fixture(arch, fn)
+      end
+    end
+
+    groups << ["libdupe.dylib", "libdupe_actual.dylib"].map do |fn|
+      fixture(:x86_64, fn)
+    end
+
+    groups.each do |filename, actual|
+      file = MachO::MachOFile.new(filename)
+
+      refute_empty file.rpaths
+      orig_ncmds = file.ncmds
+      orig_sizeofcmds = file.sizeofcmds
+      orig_npaths = file.rpaths.size
+
+      file.delete_rpath(file.rpaths.first, :last => true)
+      assert_operator file.ncmds, :<, orig_ncmds
+      assert_operator file.sizeofcmds, :<, orig_sizeofcmds
+      assert_operator file.rpaths.size, :<, orig_npaths
+      # libdupe rpaths: ["foo", "bar", "foo"]
+      assert_equal file.rpaths, %w[foo bar] if filename.end_with?("libdupe.dylib")
+
+      file.write(actual)
+      # ensure we can actually re-load and parse the modified file
+      modified = MachO::MachOFile.new(actual)
+
+      assert_empty modified.rpaths unless filename.end_with?("libdupe.dylib")
       assert_equal file.serialize.bytesize, modified.serialize.bytesize
       assert_operator modified.ncmds, :<, orig_ncmds
       assert_operator modified.sizeofcmds, :<, orig_sizeofcmds
@@ -518,16 +656,22 @@ class MachOFileTest < Minitest::Test
     end
 
     assert_raises MachO::RpathExistsError do
-      file.change_rpath(file.rpaths.first, file.rpaths.first)
-    end
-
-    assert_raises MachO::RpathExistsError do
       file.add_rpath(file.rpaths.first)
     end
 
     assert_raises MachO::RpathUnknownError do
       file.delete_rpath("/this/rpath/doesn't/exist")
     end
+  end
+
+  def test_fail_loading_fat
+    filename = fixture(%w[i386 x86_64], "libhello.dylib")
+
+    ex = assert_raises(MachO::FatBinaryError) do
+      MachO::MachOFile.new_from_bin File.read(filename)
+    end
+
+    assert_match(/must be/, ex.inspect)
   end
 
   def test_to_h
